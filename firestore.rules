@@ -1,0 +1,127 @@
+/**
+ * Core Philosophy: This ruleset enforces a strict user-ownership model while
+ * allowing for public readability of shared content like advertisements. The
+ * primary goal is to protect user-private data while enabling the core
+ * functionality of a public marketplace.
+ *
+ * Data Structure:
+ * - /users/{userId}/profile/{profileId}: All private user profile data is
+ *   stored in a subcollection under a path scoped to their unique user ID.
+ *   This enables strong, path-based security.
+ * - /ads/{adId}: Advertisements are stored in a top-level collection. This
+ *   facilitates public browsing and querying. Authorization is handled by
+ *   a 'userProfileId' field within each ad document.
+ * - /payment_transactions/{paymentTransactionId}: Sensitive transaction data is
+ *   stored in a top-level collection. Access is tightly controlled using an
+ *   owner 'userProfileId' field within each document.
+ *
+ * Key Security Decisions:
+ * - Default Deny: All paths are closed by default. Access is granted
+ *   explicitly on a per-collection basis.
+ * - User Data Privacy: A user can only access data under their own
+ *   `/users/{userId}` path. They cannot read or list other users' profiles.
+ * - Public Content: Ads are publicly readable by anyone, including
+ *   unauthenticated users, to facilitate browsing. However, write operations
+ *   (create, update, delete) are restricted to the ad's original author.
+ * - Private Transactions: Payment transactions are strictly private. A user
+ *   can only read their own transactions, and listing all transactions is
+ *   explicitly disallowed to prevent data leakage.
+ *
+ * Denormalization for Authorization: To ensure fast and secure authorization,
+ * ownership information is denormalized. The `ads` and `payment_transactions`
+ * documents contain a `userProfileId` field, which is a copy of the owner's
+ * UID. This avoids slow and costly `get()` calls to other documents during
+ * rule evaluation, making the rules more performant and secure.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ----------------------------------------------------------------------
+    // Helper Functions
+    // ----------------------------------------------------------------------
+
+    /**
+     * Checks if the user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the authenticated user's UID matches the provided userId.
+     * This is the primary function for validating ownership.
+     */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /**
+     * Verifies that a document exists before an update or delete operation.
+     * This prevents requests from modifying or deleting non-existent data.
+     */
+    function isExistingDoc() {
+      return resource != null;
+    }
+
+    /**
+     * A composite helper for update/delete operations on user-owned documents,
+     * combining ownership and existence checks for clarity and safety.
+     */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && isExistingDoc();
+    }
+
+    // ----------------------------------------------------------------------
+    // Collection Rules
+    // ----------------------------------------------------------------------
+
+    /**
+     * @description Controls access to a user's private profile document(s).
+     * @path /users/{userId}/profile/{profileId}
+     * @allow (get) An authenticated user reads their own profile. auth.uid: "user_abc", path: /users/user_abc/profile/doc1
+     * @deny (get) A user tries to read another user's profile. auth.uid: "user_abc", path: /users/user_xyz/profile/doc1
+     * @principle Restricts access to a user's own data tree using path-based security.
+     */
+    match /users/{userId}/profile/{profileId} {
+      allow get: if isOwner(userId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) && request.resource.data.id == userId;
+      allow update: if isExistingOwner(userId) && request.resource.data.id == resource.data.id;
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Manages advertisements, which are public to read but can only be modified by their owner.
+     * @path /ads/{adId}
+     * @allow (list) Any user, even unauthenticated, can list all ads. auth: null, path: /ads
+     * @allow (create) An authenticated user creates a new ad for themselves. auth.uid: "user_abc", data: { userProfileId: "user_abc", ... }
+     * @deny (update) A user tries to update an ad they do not own. auth.uid: "user_xyz", path: /ads/ad_123 (owned by user_abc)
+     * @principle Implements a "Public Read, Owner Write" pattern using a denormalized owner ID field.
+     */
+    match /ads/{adId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isSignedIn() && request.resource.data.userProfileId == request.auth.uid;
+      allow update: if isExistingDoc() && isOwner(resource.data.userProfileId);
+      allow delete: if isExistingDoc() && isOwner(resource.data.userProfileId);
+    }
+
+    /**
+     * @description Secures payment transactions, making them private to the user who created them.
+     * @path /payment_transactions/{paymentTransactionId}
+     * @allow (get) A user retrieves their own payment transaction. auth.uid: "user_abc", path: /payment_transactions/txn_123 (doc contains userProfileId: "user_abc")
+     * @deny (list) A user tries to list all transactions in the system. This is disabled for security.
+     * @deny (get) A user tries to read someone else's payment transaction. auth.uid: "user_xyz", path: /payment_transactions/txn_123 (owned by user_abc)
+     * @principle Enforces strict document ownership for sensitive data and disables potentially leaky list operations.
+     */
+    match /payment_transactions/{paymentTransactionId} {
+      allow get: if isExistingDoc() && isOwner(resource.data.userProfileId);
+      allow list: if false;
+      allow create: if isSignedIn() && request.resource.data.userProfileId == request.auth.uid;
+      allow update: if isExistingDoc() && isOwner(resource.data.userProfileId);
+      allow delete: if isExistingDoc() && isOwner(resource.data.userProfileId);
+    }
+  }
+}
+    
